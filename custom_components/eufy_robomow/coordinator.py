@@ -1,6 +1,8 @@
 """DataUpdateCoordinator for Eufy Robomow."""
+
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import timedelta
@@ -15,6 +17,7 @@ from .const import (
     TUYA_VERSION,
     POLL_INTERVAL,
     CLOUD_POLL_INTERVAL,
+    _CLOUD_MAX_BACKOFF,
     CLOUD_EDGE_MM,
     CLOUD_PATH_MM,
     CLOUD_TRAVEL_SPEED,
@@ -28,21 +31,16 @@ _LOGGER = logging.getLogger(__name__)
 # Device object to flush any stale socket / connection state.
 _MAX_CONSECUTIVE_ERRORS = 5
 
-# Keys kept across polls even when a fresh cloud fetch fails
-_CLOUD_KEYS = (
-    CLOUD_EDGE_MM,
-    CLOUD_PATH_MM,
-    CLOUD_TRAVEL_SPEED,
-    CLOUD_BLADE_SPEED,
-    CLOUD_PAD_DIRECTION,
-)
-
 
 class EufyMowerCoordinator(DataUpdateCoordinator[dict]):
     """Polls the Eufy E15 via Tuya local protocol every POLL_INTERVAL seconds.
 
-    If an EufyCloudClient is provided, cloud settings (DP155) are also polled,
-    but only once every CLOUD_POLL_INTERVAL seconds to avoid hammering the API.
+    If an EufyCloudClient is provided, cloud DPS are also fetched every
+    CLOUD_POLL_INTERVAL seconds (default 5 min).  ALL raw cloud DPS are merged
+    into coordinator.data so every DP is visible as a HA sensor — even cloud-only
+    ones like DP3, DP4, DP36, DP102-DP185 that the local Tuya protocol never
+    returns.  For any DP present in both transports the local (real-time) value
+    takes precedence.
     """
 
     def __init__(
@@ -51,7 +49,7 @@ class EufyMowerCoordinator(DataUpdateCoordinator[dict]):
         host: str,
         device_id: str,
         local_key: str,
-        cloud_client=None,   # EufyCloudClient | None  (avoid circular import)
+        cloud_client=None,  # EufyCloudClient | None  (avoid circular import)
     ) -> None:
         super().__init__(
             hass,
@@ -65,10 +63,26 @@ class EufyMowerCoordinator(DataUpdateCoordinator[dict]):
         self.cloud_client = cloud_client
 
         self._device = self._make_device()
-        # Use float('-inf') so the first poll always fetches cloud settings
+        # Use float('-inf') so the first poll always fetches cloud DPS
         self._cloud_last_fetch: float = float("-inf")
+        # Consecutive cloud failures — used for exponential backoff
+        self._cloud_consecutive_failures: int = 0
         # Track consecutive local-poll failures to know when to recreate the device
         self._consecutive_errors: int = 0
+        # Set of all DP keys seen so far (local + cloud), used to detect new DPs
+        self._known_dps: set[str] = set()
+        # Callbacks invoked when previously-unseen DPS keys appear in a poll.
+        # Registered by sensor.py so it can add generic sensors on-the-fly.
+        # Callbacks receive the current dps dict as their sole argument.
+        self._new_dp_callbacks: list = []
+
+    def async_add_new_dp_listener(self, callback) -> None:
+        """Register *callback(dps)* to be called whenever new DPS keys are discovered.
+
+        The callback receives the current complete DPS dict as its argument so it
+        can inspect the latest values without waiting for coordinator.data to update.
+        """
+        self._new_dp_callbacks.append(callback)
 
     def _make_device(self) -> tinytuya.Device:
         d = tinytuya.Device(
@@ -88,14 +102,25 @@ class EufyMowerCoordinator(DataUpdateCoordinator[dict]):
     # ── polling ───────────────────────────────────────────────────────────────
 
     async def _async_update_data(self) -> dict:
-        """Fetch DPS from device (and optionally cloud settings)."""
+        """Fetch DPS from device (local) and optionally from cloud.
+
+        Strategy:
+          1. Local poll  — always, every POLL_INTERVAL seconds (~10 s).
+          2. Cloud poll  — every CLOUD_POLL_INTERVAL seconds (~5 min).
+             • Fetches ALL raw cloud DPS via tuya.m.device.dp.get.
+             • Merges them into the dict: local values win for any DP in both.
+             • Decoded DP155 settings are stored under cloud_* keys.
+          3. Carry-forward — when cloud poll is not due (or fails), all keys from
+             the previous coordinator.data that are not in the fresh local dps are
+             carried forward so cloud-only entities never go unavailable.
+          4. New-DP detection — after the full merge, new DPS keys fire the
+             _new_dp_callbacks with the complete dps dict so sensor.py can
+             register generic sensors immediately.
+        """
         # ── 1. Local DPS (every POLL_INTERVAL seconds) ────────────────────────
         try:
             result = await self.hass.async_add_executor_job(self._device.status)
         except Exception as exc:  # noqa: BLE001
-            # A Python exception from tinytuya (e.g. socket error, SSL error).
-            # Increment the error counter; recreate the device object when the
-            # threshold is reached so stale socket state is fully flushed.
             self._consecutive_errors += 1
             if self._consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
                 _LOGGER.debug(
@@ -119,42 +144,116 @@ class EufyMowerCoordinator(DataUpdateCoordinator[dict]):
                 self._consecutive_errors = 0
             raise UpdateFailed(f"Tuya error: {err}")
 
-        # Successful poll — reset the error counter
         self._consecutive_errors = 0
-
         dps: dict = result.get("dps", {})
-        _LOGGER.debug("DPS update: %s", dps)
+        local_dp_keys: set[str] = set(dps.keys())
 
-        # ── 2. Cloud settings (every CLOUD_POLL_INTERVAL seconds) ─────────────
+        _LOGGER.debug("Local DPS update: %s", dps)
+
+        # ── 2. Cloud DPS + settings (every CLOUD_POLL_INTERVAL seconds) ───────
+        # Two guards before attempting a cloud poll:
+        #   a) Sun above horizon — mower cannot operate at night, no point refreshing.
+        #      Uses HA's sun.sun entity; if unavailable defaults to allowing the poll.
+        #   b) Exponential backoff on consecutive failures (5 min → 10 → 20 → 40 → 60).
+        #      _cloud_last_fetch is updated on BOTH success AND failure so a failed
+        #      login is not retried every 10 s (which would hammer the Eufy API and
+        #      interfere with other integrations sharing the same account).
+        now = time.monotonic()
         if self.cloud_client is not None:
-            now = time.monotonic()
-            if now - self._cloud_last_fetch >= CLOUD_POLL_INTERVAL:
-                try:
-                    cloud_settings = await self.hass.async_add_executor_job(
-                        self.cloud_client.get_settings
-                    )
-                    dps[CLOUD_EDGE_MM]       = cloud_settings["edge_mm"]
-                    dps[CLOUD_PATH_MM]       = cloud_settings["path_mm"]
-                    dps[CLOUD_TRAVEL_SPEED]  = cloud_settings["travel_speed"]
-                    dps[CLOUD_BLADE_SPEED]   = cloud_settings["blade_speed"]
-                    dps[CLOUD_PAD_DIRECTION] = cloud_settings["pad_direction"]
-                    self._cloud_last_fetch = now
-                    _LOGGER.debug("Cloud settings refreshed: %s", cloud_settings)
-                except Exception as exc:  # noqa: BLE001
-                    _LOGGER.warning("Cloud settings fetch failed: %s", exc)
-                    # Preserve the previous values so entities don't go unavailable
-                    if self.data:
-                        for key in _CLOUD_KEYS:
-                            if key in self.data:
-                                dps[key] = self.data[key]
+            _sun = self.hass.states.get("sun.sun")
+            _sun_below_horizon = _sun is not None and _sun.state == "below_horizon"
+
+            if _sun_below_horizon:
+                _LOGGER.debug("Sun below horizon — skipping cloud poll")
+                self._carry_forward_cloud_data(dps, local_dp_keys)
             else:
-                # Not yet due for a cloud refresh — carry forward previous values
-                if self.data:
-                    for key in _CLOUD_KEYS:
-                        if key in self.data:
-                            dps[key] = self.data[key]
+                backoff = min(
+                    CLOUD_POLL_INTERVAL * (2 ** self._cloud_consecutive_failures),
+                    _CLOUD_MAX_BACKOFF,
+                )
+                if now - self._cloud_last_fetch >= backoff:
+                    try:
+                        raw_cloud_dps, cloud_settings = (
+                            await self.hass.async_add_executor_job(
+                                self.cloud_client.get_all_dps
+                            )
+                        )
+                        # Merge: add every cloud DP that is NOT already in local dps.
+                        # Local values take precedence (more real-time).
+                        for dp_key, dp_val in raw_cloud_dps.items():
+                            if dp_key not in local_dp_keys:
+                                dps[dp_key] = dp_val
+
+                        # Decoded DP155 settings under cloud_* keys
+                        dps[CLOUD_EDGE_MM] = cloud_settings["edge_mm"]
+                        dps[CLOUD_PATH_MM] = cloud_settings["path_mm"]
+                        dps[CLOUD_TRAVEL_SPEED] = cloud_settings["travel_speed"]
+                        dps[CLOUD_BLADE_SPEED] = cloud_settings["blade_speed"]
+                        dps[CLOUD_PAD_DIRECTION] = cloud_settings["pad_direction"]
+
+                        self._cloud_last_fetch = now
+                        self._cloud_consecutive_failures = 0
+                        _LOGGER.debug(
+                            "Cloud poll: %d raw DPS merged, settings=%s",
+                            len(raw_cloud_dps),
+                            cloud_settings,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        self._cloud_consecutive_failures += 1
+                        next_retry = min(
+                            CLOUD_POLL_INTERVAL * (2 ** self._cloud_consecutive_failures),
+                            _CLOUD_MAX_BACKOFF,
+                        )
+                        _LOGGER.warning(
+                            "Cloud DPS fetch failed (attempt %d, next retry in %ds): %s",
+                            self._cloud_consecutive_failures,
+                            next_retry,
+                            exc,
+                        )
+                        # Update timestamp so the failed attempt is not retried on the
+                        # next local poll (10 s); retry honours the backoff window.
+                        self._cloud_last_fetch = now
+                        self._carry_forward_cloud_data(dps, local_dp_keys)
+                else:
+                    # Not yet due — carry forward previous cloud data
+                    self._carry_forward_cloud_data(dps, local_dp_keys)
+
+        # ── 3. New-DP detection (after full merge) ────────────────────────────
+        current_all_keys = set(dps.keys())
+        new_keys = current_all_keys - self._known_dps
+
+        def _dp_sort_key(k: str):
+            # Numeric DP keys sort before string keys (e.g. "cloud_edge_mm").
+            # Returns a (int, str) tuple so comparisons are always type-compatible.
+            return (0, int(k)) if k.isdigit() else (1, k)
+
+        if new_keys:
+            _LOGGER.info(
+                "New DPS discovered: %s",
+                sorted(new_keys, key=_dp_sort_key),
+            )
+            for k in sorted(new_keys, key=_dp_sort_key):
+                _LOGGER.info("  DP%s = %r (%s)", k, dps[k], type(dps[k]).__name__)
+            # Pass the current full dps dict so callbacks don't read stale data
+            for cb in list(self._new_dp_callbacks):
+                cb(dps)
+        self._known_dps = current_all_keys
 
         return dps
+
+    def _carry_forward_cloud_data(
+        self, dps: dict, local_dp_keys: set[str]
+    ) -> None:
+        """Copy all non-local keys from the previous coordinator.data into dps.
+
+        This keeps cloud-only DP sensors from going unavailable between cloud polls.
+        Local DP values already in dps are never overwritten.
+        """
+        if not self.data:
+            return
+        for key, val in self.data.items():
+            if key not in local_dp_keys:
+                dps[key] = val
 
     # ── commands ──────────────────────────────────────────────────────────────
 
@@ -176,11 +275,13 @@ class EufyMowerCoordinator(DataUpdateCoordinator[dict]):
     async def async_set_cloud_setting(self, **kwargs) -> bool:
         """Write one or more cloud settings via the Tuya mobile API.
 
-        Keyword arguments: edge_mm, path_mm, travel_speed, blade_speed.
+        Keyword arguments: edge_mm, path_mm, travel_speed, blade_speed, pad_direction.
         Returns True on success.
         """
         if not self.cloud_client:
-            _LOGGER.error("async_set_cloud_setting called but no cloud client configured")
+            _LOGGER.error(
+                "async_set_cloud_setting called but no cloud client configured"
+            )
             return False
 
         def _do_set() -> None:
@@ -188,10 +289,19 @@ class EufyMowerCoordinator(DataUpdateCoordinator[dict]):
 
         try:
             await self.hass.async_add_executor_job(_do_set)
+            # Small delay to let cloud process the write before re-fetching
+            await asyncio.sleep(1)
             # Force a cloud re-fetch on the next poll cycle
             self._cloud_last_fetch = float("-inf")
             await self.async_request_refresh()
             return True
         except Exception as exc:  # noqa: BLE001
-            _LOGGER.error("Cloud setting update failed: %s", exc)
+            exc_str = str(exc)
+            if "DEVICE_OFFLINE" in exc_str or "offline" in exc_str.lower():
+                _LOGGER.warning(
+                    "Cannot update cloud setting: device is offline "
+                    "(command will not be queued; retry when mower is running)"
+                )
+            else:
+                _LOGGER.error("Cloud setting update failed: %s", exc)
             return False

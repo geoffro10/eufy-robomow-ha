@@ -2,11 +2,12 @@
 
 Local entities (backed by Tuya DPS):
   • Cut Height      — DP110, 25–75 mm, step 5 mm (slider)
+  • Volume          — DP26,  0–100 %, step 1 % (speaker volume)
 
-Cloud entities (backed by DP154/DP155 via Tuya mobile API):
+Cloud entities (backed by DP155 via Tuya mobile API):
   • Edge Distance   — DP155 field 3, -15 to +15 cm, step 1 cm
     (negative = cut beyond wire, positive = stay inside)
-  • Pad Direction   — DP154, 0–359°, step 1° (rotary; full rotation)
+  • Pad Direction   — DP155 field 4, 0–359°, step 1° (rotary; full rotation)
 
 Path distance is a fixed 3-option select; see select.py.
 """
@@ -15,7 +16,7 @@ from __future__ import annotations
 
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfLength
+from homeassistant.const import PERCENTAGE, UnitOfLength
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -28,6 +29,7 @@ from .const import (
     CUT_HEIGHT_MIN,
     CUT_HEIGHT_MAX,
     CUT_HEIGHT_STEP,
+    DP_VOLUME,
     CLOUD_EDGE_MM,
     EDGE_DISTANCE_MIN,
     EDGE_DISTANCE_MAX,
@@ -47,7 +49,10 @@ async def async_setup_entry(
 ) -> None:
     coordinator: EufyMowerCoordinator = hass.data[DOMAIN][entry.entry_id]
 
-    entities: list[NumberEntity] = [EufyCutHeightNumber(coordinator, entry)]
+    entities: list[NumberEntity] = [
+        EufyCutHeightNumber(coordinator, entry),
+        EufyVolumeNumber(coordinator, entry),
+    ]
 
     if coordinator.cloud_client is not None:
         entities.append(EufyEdgeDistanceNumber(coordinator, entry))
@@ -89,6 +94,38 @@ class EufyCutHeightNumber(CoordinatorEntity[EufyMowerCoordinator], NumberEntity)
 
     async def async_set_native_value(self, value: float) -> None:
         await self.coordinator.async_send_command(DP_CUT_HEIGHT, int(value))
+
+
+class EufyVolumeNumber(CoordinatorEntity[EufyMowerCoordinator], NumberEntity):
+    """Speaker volume for the Eufy E15 (local DPS 26, 0–100 %)."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Volume"
+    _attr_icon = "mdi:volume-high"
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_native_min_value = 0
+    _attr_native_max_value = 100
+    _attr_native_step = 1
+    _attr_mode = NumberMode.SLIDER
+
+    def __init__(
+        self,
+        coordinator: EufyMowerCoordinator,
+        entry: ConfigEntry,
+    ) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.data[CONF_DEVICE_ID]}_volume"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.data[CONF_DEVICE_ID])},
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        val = self.coordinator.data.get(DP_VOLUME)
+        return float(val) if val is not None else None
+
+    async def async_set_native_value(self, value: float) -> None:
+        await self.coordinator.async_send_command(DP_VOLUME, int(value))
 
 
 # ── Cloud entity ───────────────────────────────────────────────────────────────
@@ -146,12 +183,10 @@ class EufyEdgeDistanceNumber(CoordinatorEntity[EufyMowerCoordinator], NumberEnti
 class EufyPadDirectionNumber(CoordinatorEntity[EufyMowerCoordinator], NumberEntity):
     """Mowing path direction for the Eufy E15.
 
-    DP154 stores the mowing angle as an integer in degrees (0–359).
+    DP155 field 4 stores the mowing angle (0–359°) in sub-field f2.f1.
     The app shows a rotary control for a full rotation.
-
-    Confirmed encoding:
-        degrees 0 → b'\\x00'  (base64 "AA==")  — device-native quirk
-        degrees N → protobuf field 3 = N       for N > 0
+    The device uses a compass reference (0=west, 90=north), but we normalize
+    to match the app: 0=north, 90=east, 180=south, 270=west.
     """
 
     _attr_has_entity_name = True
@@ -180,7 +215,8 @@ class EufyPadDirectionNumber(CoordinatorEntity[EufyMowerCoordinator], NumberEnti
         direction = self.coordinator.data.get(CLOUD_PAD_DIRECTION)
         if direction is None:
             return None
-        return float(direction)
+        # Normalize from device (0=west) to app (0=north): subtract 90°
+        return float((direction - 90) % 360)
 
     @property
     def available(self) -> bool:
@@ -191,5 +227,8 @@ class EufyPadDirectionNumber(CoordinatorEntity[EufyMowerCoordinator], NumberEnti
         )
 
     async def async_set_native_value(self, value: float) -> None:
-        """Send new pad direction (degrees → DP154)."""
-        await self.coordinator.async_set_cloud_setting(pad_direction=round(value))
+        """Send new pad direction (degrees → DP155)."""
+        # Convert from app (0=north) to device (0=west): add 90°
+        await self.coordinator.async_set_cloud_setting(
+            pad_direction=(round(value) + 90) % 360
+        )

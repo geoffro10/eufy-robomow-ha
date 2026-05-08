@@ -5,7 +5,16 @@ DOMAIN = "eufy_robomow"
 # Tuya local protocol
 DEFAULT_PORT = 6668
 TUYA_VERSION = 3.5
-POLL_INTERVAL = 30  # seconds — 10 s was too aggressive; caused thread/FD pressure
+POLL_INTERVAL = 10  # seconds — reduced for faster reverse engineering
+
+# Generic sensor prefix for unmapped DPS
+GENERIC_SENSOR_PREFIX = "dp"
+
+# Speed options (used by select.py)
+SPEED_SLOW = "slow"
+SPEED_NORMAL = "normal"
+SPEED_FAST = "fast"
+SPEED_OPTIONS = [SPEED_SLOW, SPEED_NORMAL, SPEED_FAST]
 
 # Config entry keys
 CONF_DEVICE_ID = "device_id"
@@ -15,7 +24,9 @@ CONF_EUFY_PASSWORD = "eufy_password"  # optional — enables cloud settings
 
 # ── Cloud settings poll interval ───────────────────────────────────────────────
 # Cloud settings are fetched at most once every N seconds (much slower than local).
-CLOUD_POLL_INTERVAL = 300  # 5 minutes
+# On repeated failures, the coordinator applies exponential backoff up to the cap.
+CLOUD_POLL_INTERVAL = 300   # 5 minutes (base retry interval)
+_CLOUD_MAX_BACKOFF  = 3600  # 1 hour   (maximum retry interval after repeated failures)
 
 # ── Cloud settings data keys (stored in coordinator.data) ─────────────────────
 # These keys coexist with numeric DPS keys; the "cloud_" prefix avoids collisions.
@@ -47,11 +58,10 @@ PATH_DISTANCE_MM: dict[str, int] = {"8 cm": 80, "10 cm": 100, "12 cm": 120}
 # Confirmed live data points:
 #   12 o'clock (north) ≈ 90–91
 #   3  o'clock (east)  ≈ 178–180
-# DP154 was previously assumed to hold this, but live testing showed it does NOT
-# change when the app's direction dial is moved.  DP154's purpose is unknown.
-PAD_DIRECTION_MIN = 0    # degrees (west / 9 o'clock)
+# NOTE: DP154 is the zone-mow-mode signal, NOT the direction DP.
+PAD_DIRECTION_MIN = 0  # degrees (west / 9 o'clock)
 PAD_DIRECTION_MAX = 359  # degrees (full rotation)
-PAD_DIRECTION_STEP = 1   # degrees
+PAD_DIRECTION_STEP = 1  # degrees
 
 # ── DPS READ (status) ──────────────────────────────────────────────────────────
 # Confirmed via live monitoring of Eufy E15 (Tuya v3.5)
@@ -59,15 +69,29 @@ PAD_DIRECTION_STEP = 1   # degrees
 DP_TASK_ACTIVE = "1"  # bool  True = a mowing/returning session is running
 DP_PAUSED = "2"  # bool  True = session paused, False = actively moving
 DP_BATTERY = "8"  # int   Battery level 0–100 %
+DP_VOLUME = "26"  # int   Speaker volume 0–100 %
+DP_CHILD_PROTECTION = "47"  # bool  True = child/pet protection active
+DP_SIGNAL = "109"  # int   Signal strength (raw value; e.g. 50 → −50 dBm)
 DP_CUT_HEIGHT = "110"  # int   Blade height in mm (e.g. 40)
+DP_LIVE_VIEW = "114"  # int   Live-view/camera state:
+#       32  = idle (no live view)
+#       103 = camera enabled (user opened live view)
+#       104 = camera disabled (user closed live view)
 DP_PROGRESS = "118"  # int   0–100 % progress of current action
 #       0   = idle / mowing
 #       1-99 = saving map or returning to base
 #       100 = docked / fully done
-DP_AREA = "126"  # int   Mowed area counter (exact unit unconfirmed)
 DP_TOTAL_TIME = "125"  # int   Total mow time — ~6.6 sec/unit
 #       36149 units ≈ 66h (app: 2d 18h) ✓
+DP_AREA = "126"  # int   Mowed area counter (exact unit unconfirmed)
+DP_RAIN_DETECTION = "101"  # bool  True = stop mowing when rain detected (writable setting)
+DP_SMART_SUGGESTION = "132"  # bool  Smart suggestion for no-go zones
+DP_REAL_LAWN_MAP = "133"  # bool  Real lawn map feature enabled
 DP_NETWORK = "134"  # str   "Wifi" or "Cellular"
+DP_MOW_YELLOW_GRASS = "141"  # bool  Allow mowing on yellow/dry grass
+
+# ── Unmapped DPs for reverse engineering (all DPS exposed as sensors) ─────────
+# These are automatically discovered and added as generic sensors.
 
 # ── DPS WRITE (commands) ──────────────────────────────────────────────────────
 # NOTE: These have NOT yet been confirmed by writing locally.
@@ -91,7 +115,10 @@ CUT_HEIGHT_STEP = 5  # mm
 #  DP1 absent,  DP2 absent                    → DOCKED  (cold / never started)
 #  DP1=True,    DP2=False,  DP118=0           → MOWING
 #  DP1=True,    DP2=False,  DP118 5–99        → RETURNING (progress back to base)
-#  DP1=True,    DP2=False,  DP118=100         → DOCKED  (returned after session)
+#  DP1=True,    DP2=False,  DP118=100         → MOWING  (briefly docked mid-session
+#                                               for charging; DP1 still True so we
+#                                               report MOWING not DOCKED)
+#  DP1 absent/False                           → DOCKED  (no active session)
 #  DP1=True,    DP2=True                      → PAUSED
 #
 RETURNING_THRESHOLD = 5  # DP118 ≥ this value while DP1 active = RETURNING

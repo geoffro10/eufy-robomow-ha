@@ -121,12 +121,12 @@ class EufyRobomowConfigFlow(ConfigFlow, domain=DOMAIN):
         # Build the dropdown options {devId: "Name [id…]"}
         options = {d["devId"]: _device_label(d) for d in self._discovered}
 
-        # Smart defaults — auto-select single device, pre-fill IP if known
+        # Auto-select when there is only one device.
+        # Note: the cloud API's "ip" field reports the IP the device last connected
+        # FROM, which is often the router's public IP or a 4G address — not the
+        # device's LAN IP.  We intentionally leave CONF_HOST blank so the user
+        # enters the correct internal address.
         auto_id = self._discovered[0]["devId"] if len(self._discovered) == 1 else None
-        auto_ip = next(
-            (d.get("ip", "") for d in self._discovered if d["devId"] == (auto_id or "")),
-            "",
-        )
 
         step_schema = vol.Schema(
             {
@@ -170,12 +170,10 @@ class EufyRobomowConfigFlow(ConfigFlow, domain=DOMAIN):
                     },
                 )
 
-        # Pre-populate the form with smart defaults
+        # Pre-populate the form with smart defaults (device ID only; host is manual)
         suggested: dict[str, Any] = {}
         if auto_id:
             suggested[CONF_DEVICE_ID] = auto_id
-        if auto_ip:
-            suggested[CONF_HOST] = auto_ip
 
         return self.async_show_form(
             step_id="device",

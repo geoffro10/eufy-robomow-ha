@@ -25,12 +25,12 @@ from .coordinator import EufyMowerCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-# Always register SELECT; async_setup_entry in select.py is a no-op when no cloud client.
 PLATFORMS: list[Platform] = [
     Platform.LAWN_MOWER,
     Platform.SENSOR,
     Platform.NUMBER,
-    Platform.SELECT,
+    Platform.SELECT,   # no-op when no cloud client (handled in select.py)
+    Platform.SWITCH,
 ]
 
 

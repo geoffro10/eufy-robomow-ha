@@ -192,8 +192,8 @@ def _encode_field4(pad_direction: int) -> bytes:
     Structure: {f2: {f1: angle}, f3: fixed, f5: fixed}
     The f3 and f5 sub-fields are device constants preserved verbatim.
     """
-    f2_inner = _encode_field(1, 0, pad_direction)   # {f1: angle}
-    f2 = _encode_field(2, 2, f2_inner)              # field 2 = {f1: angle}
+    f2_inner = _encode_field(1, 0, pad_direction)  # {f1: angle}
+    f2 = _encode_field(2, 2, f2_inner)  # field 2 = {f1: angle}
     return f2 + _FIELD4_SUFFIX
 
 
@@ -289,8 +289,14 @@ def _decode_dp155(blob: str) -> dict[str, Any]:
                                 pad_val, _ = _varint_decode(f4_inner, sub_pos)
                     else:
                         break
+                # Clamp to valid compass range; guards against malformed blobs
+                if pad_val > 500:
+                    _LOGGER.error(
+                        "DP155 field4 pad_direction invalid (%d), likely parsing error",
+                        pad_val,
+                    )
+                    pad_val = pad_val % 360
                 settings["pad_direction"] = pad_val
-                _LOGGER.debug("DP155 field4 pad_direction decoded: %d", pad_val)
 
         else:
             _LOGGER.warning(
@@ -543,7 +549,10 @@ class EufyCloudClient:
         payload = resp.json()
 
         if "result" not in payload:
-            raise RuntimeError(f"Tuya API error response: {payload}")
+            # Surface device-side errors with a recognisable prefix so callers
+            # can distinguish them from transient session / auth failures.
+            error_code = payload.get("errorCode", "unknown")
+            raise RuntimeError(f"Device error [{error_code}]: {payload}")
 
         return payload["result"]
 
@@ -590,10 +599,17 @@ class EufyCloudClient:
         self._eufy_token = None
 
     def _tuya_request_with_retry(self, *args, **kwargs) -> Any:
-        """Call _tuya_request; on failure invalidate sessions and retry once."""
+        """Call _tuya_request; on session/auth failure invalidate and retry once.
+
+        Device-side errors (DEVICE_OFFLINE, etc.) are not retried because
+        invalidating the session won't fix them.
+        """
         try:
             return self._tuya_request(*args, **kwargs)
-        except Exception:
+        except RuntimeError as exc:
+            # "Device error [...]" prefix → device-side issue, no point retrying
+            if str(exc).startswith("Device error"):
+                raise
             _LOGGER.warning(
                 "Tuya API call failed, invalidating sessions and retrying once"
             )
@@ -656,32 +672,49 @@ class EufyCloudClient:
         _LOGGER.debug("Discovered %d devices with local keys", len(devices))
         return devices
 
+    def get_all_dps(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Fetch ALL DPS from the cloud in a single API call.
+
+        Returns a tuple of (raw_dps, decoded_settings) where:
+          • raw_dps         — complete DPS dict from cloud (string DP-id keys → values)
+          • decoded_settings — parsed DP155: edge_mm, path_mm, travel_speed,
+                               blade_speed, pad_direction
+
+        Callers should merge raw_dps into coordinator.data so that every cloud-only
+        DP (DP3, DP4, DP5, DP36, DP42, DP102–DP185 …) is visible in HA as a generic
+        sensor even though the local Tuya poll never returns it.  Local values take
+        precedence over cloud values for any DP available in both transports.
+        """
+        raw_dps: dict[str, Any] = self._tuya_request_with_retry(
+            "tuya.m.device.dp.get",
+            data={"devId": self._device_id},
+        )
+
+        blob155 = raw_dps.get("155")
+        if not blob155:
+            raise RuntimeError(
+                "DP155 not present in cloud response — "
+                f"available DPS: {list(raw_dps.keys())}"
+            )
+        settings = _decode_dp155(blob155)
+        settings.setdefault("pad_direction", 90)
+
+        _LOGGER.debug(
+            "Cloud poll: %d raw DPS, settings=%s", len(raw_dps), settings
+        )
+        return raw_dps, settings
+
     def get_settings(self) -> dict[str, Any]:
         """Fetch DP155 from the cloud and return all decoded settings.
 
         Returns a dict with keys:
             edge_mm, path_mm, travel_speed, blade_speed, pad_direction  (all from DP155)
 
-        pad_direction is an integer angle in degrees (0–359).
-        Reference: 0 = west (9 o'clock), 90 = north (12 o'clock),
-                   180 = east (3 o'clock), 270 = south (6 o'clock).
+        .. deprecated::
+            Use get_all_dps() instead — it returns the same decoded settings together
+            with the full raw DP dict, reusing the same single API call.
         """
-        dps = self._tuya_request_with_retry(
-            "tuya.m.device.dp.get",
-            data={"devId": self._device_id},
-        )
-        blob155 = dps.get("155")
-        if not blob155:
-            raise RuntimeError(
-                "DP155 not present in cloud response — "
-                f"available DPS: {list(dps.keys())}"
-            )
-        settings = _decode_dp155(blob155)
-
-        # Ensure pad_direction always present (default 90 = north if field 4 absent)
-        settings.setdefault("pad_direction", 90)
-
-        _LOGGER.debug("Cloud settings decoded: %s", settings)
+        _raw, settings = self.get_all_dps()
         return settings
 
     def set_settings(
@@ -713,7 +746,10 @@ class EufyCloudClient:
         )
 
         blob155 = _encode_dp155(
-            new_edge_mm, new_path_mm, new_travel_speed, new_blade_speed,
+            new_edge_mm,
+            new_path_mm,
+            new_travel_speed,
+            new_blade_speed,
             new_pad_direction,
         )
         _LOGGER.debug(

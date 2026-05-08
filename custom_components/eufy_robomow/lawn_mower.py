@@ -75,17 +75,16 @@ class EufyRobomowEntity(CoordinatorEntity[EufyMowerCoordinator], LawnMowerEntity
         dps = self.coordinator.data
         dp1   = dps.get(DP_TASK_ACTIVE, False)
         dp2   = dps.get(DP_PAUSED,      False)
-        dp118 = dps.get(DP_PROGRESS,    100)
+        dp118 = dps.get(DP_PROGRESS,    0)
 
         # Paused: task active but movement stopped
         if dp1 and dp2:
             return LawnMowerActivity.PAUSED
 
         if dp1 and not dp2:
-            # DP118=100 → task finished, mower is back in dock
-            if dp118 >= 100:
-                return LawnMowerActivity.DOCKED
             # DP118 climbing (5–99) → mower returning to base
+            # DP118=100 means briefly docked mid-session for charging; DP1 is still
+            # True so we report MOWING rather than DOCKED (fixes stuck-docked bug).
             if dp118 >= RETURNING_THRESHOLD:
                 try:
                     return LawnMowerActivity.RETURNING
@@ -103,10 +102,8 @@ class EufyRobomowEntity(CoordinatorEntity[EufyMowerCoordinator], LawnMowerEntity
         """Start or resume mowing."""
         current = self.activity
         if current == LawnMowerActivity.PAUSED:
-            # Resume paused session
             dp, val = CMD_RESUME
         else:
-            # Start a fresh mowing session
             dp, val = CMD_START
         await self.coordinator.async_send_command(dp, val)
 
