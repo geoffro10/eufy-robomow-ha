@@ -26,6 +26,7 @@ from .const import (
     CMD_RESUME,
     CMD_DOCK,
     RETURNING_THRESHOLD,
+    CONF_DEVICE_NAME,
 )
 from .coordinator import EufyMowerCoordinator
 
@@ -61,11 +62,15 @@ class EufyRobomowEntity(CoordinatorEntity[EufyMowerCoordinator], LawnMowerEntity
         super().__init__(coordinator)
         self._entry = entry
         self._attr_unique_id = f"{entry.data[CONF_DEVICE_ID]}_mower"
+        # Note: The cloud device names seem to be internal model IDs.
+        # E18 returns "eufy S1200" assuming to be based on the Terramow S1200
+        # E15 equivalent is unknown -- falls back to "Eufy Robomow" if not found
+        name = entry.data.get(CONF_DEVICE_NAME, "Eufy Robomow")
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.data[CONF_DEVICE_ID])},
-            name="Eufy Robomow E15",
+            name=name,
             manufacturer="Eufy (Anker)",
-            model="E15",
+            model=name,
         )
 
     # ── activity ──────────────────────────────────────────────────────────────

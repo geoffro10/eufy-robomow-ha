@@ -24,6 +24,7 @@ from .const import (
     CONF_LOCAL_KEY,
     CONF_EUFY_EMAIL,
     CONF_EUFY_PASSWORD,
+    CONF_DEVICE_NAME,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -172,6 +173,7 @@ class EufyRobomowConfigFlow(ConfigFlow, domain=DOMAIN):
                         CONF_LOCAL_KEY:     local_key,
                         CONF_EUFY_EMAIL:    self._email,
                         CONF_EUFY_PASSWORD: self._password,
+                        CONF_DEVICE_NAME:   device_name, 
                     },
                 )
 

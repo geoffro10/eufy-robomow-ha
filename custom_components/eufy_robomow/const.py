@@ -21,6 +21,7 @@ CONF_DEVICE_ID = "device_id"
 CONF_LOCAL_KEY = "local_key"
 CONF_EUFY_EMAIL = "eufy_email"  # optional — enables cloud settings
 CONF_EUFY_PASSWORD = "eufy_password"  # optional — enables cloud settings
+CONF_DEVICE_NAME = "device_name"
 
 # ── Cloud settings poll interval ───────────────────────────────────────────────
 # Cloud settings are fetched at most once every N seconds (much slower than local).
