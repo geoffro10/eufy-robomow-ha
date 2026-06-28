@@ -21,6 +21,7 @@ from .const import (
     DP_TASK_ACTIVE,
     DP_PAUSED,
     DP_PROGRESS,
+    DP_AREA,
     CMD_START,
     CMD_PAUSE,
     CMD_RESUME,
@@ -75,68 +76,93 @@ class EufyRobomowEntity(CoordinatorEntity[EufyMowerCoordinator], LawnMowerEntity
         )
         # Map-save state tracking (see _handle_coordinator_update docstring)
         self._prev_dp1: bool = False
+        self._prev_dp118: int = 0
         self._was_returning: bool = False
         self._expecting_map_save: bool = False
         self._false_poll_count: int = 0
         self._in_map_save: bool = False
+        # Flicker suppression: DP126 (mowed area) increments during real mowing
+        # but never changes during post-session DP1=True flickers.
+        self._prev_dp126: int = 0
+        self._dp1_true_polls: int = 0
+        self._dp126_confirmed: bool = False
 
     # ── map-save disambiguation ────────────────────────────────────────────────
 
     def _handle_coordinator_update(self) -> None:
-        """Track DP1/DP118 transitions to distinguish map saving from returning.
+        """Track DP1/DP118 transitions to suppress RETURNING during map saving.
 
-        End-of-session sequence:
-          returning  → DP1=True,  DP118 climbs          (RETURNING)
-          dock       → DP1 briefly False, DP118 resets to 0
-          map save   → DP1=True,  DP118 climbs again    (should be MOWING)
-          done       → DP1=False
+        Confirmed sequences:
+          mowing    → DP1=True,  DP118=0            → MOWING
+          returning → DP1=True,  DP118=5–99         → RETURNING
+          dock      → DP1=False, DP118 resets
+          map save  → DP1=True,  DP118 climbs 0→100 → DOCKED
+          done      → DP1=False
 
-        Mid-session charge dock: DP1 stays True throughout — no False transition,
-        so _expecting_map_save is never set and a subsequent return shows RETURNING.
+        In-place map save (stop without docking):
+          DP118 drops from ≥5 to 1–4 while DP1 stays True, then climbs back.
 
-        Cancelled session (e.g. sunset): DP1 goes False and stays False.
-        After MAP_SAVE_TIMEOUT_POLLS consecutive False polls we abandon the
-        map-save expectation so the next scheduled mow starts fresh.
+        DP2 (pause/resume) is not tracked here; those cycles have no effect
+        on map-save detection.
         """
         dps = self.coordinator.data or {}
         dp1   = dps.get(DP_TASK_ACTIVE, False)
         dp118 = dps.get(DP_PROGRESS, 0)
+        dp126 = dps.get(DP_AREA, 0)
 
         if dp1:
             self._false_poll_count = 0
 
             if not self._prev_dp1:
-                # DP1 just went True — either a new mow session or map-save start.
+                # DP1 just went True: new mow session or post-dock map save.
                 if self._expecting_map_save:
                     self._in_map_save = True
                     self._expecting_map_save = False
                 else:
                     self._in_map_save = False
                 self._was_returning = False
-
-            if dp118 >= RETURNING_THRESHOLD:
-                self._was_returning = True
+                self._dp1_true_polls = 0
+                self._dp126_confirmed = False
+            else:
+                # DP1 stayed True.
+                self._dp1_true_polls += 1
+                if dp126 != self._prev_dp126:
+                    self._dp126_confirmed = True
+                if dp118 >= RETURNING_THRESHOLD:
+                    self._was_returning = True
+                # In-place map save: DP118 drops from return-range to near-zero
+                # while DP1 never dips False (stop-without-dock sequence).
+                if (self._prev_dp118 >= RETURNING_THRESHOLD
+                        and dp118 < RETURNING_THRESHOLD
+                        and dp118 > 0
+                        and not self._in_map_save):
+                    self._in_map_save = True
+                    self._was_returning = False
 
         else:
             self._false_poll_count += 1
 
             if self._prev_dp1:
-                # DP1 just went False — mower docked after a return trip, OR session
-                # was cancelled.  Only arm map-save expectation if we actually saw a
-                # return trip AND we aren't already in a map-save phase (which would
-                # mean this False is the end of map saving, not the dock-before-save).
-                if self._was_returning and not self._in_map_save:
+                # DP1 just went False: docked after return, map save ended, or cancelled.
+                if self._in_map_save:
+                    # Map saving finished — next DP1 True is a fresh session.
+                    self._expecting_map_save = False
+                elif self._was_returning:
+                    # Completed a return trip and docked; post-dock map save follows.
                     self._expecting_map_save = True
+                # else: cancelled before returning — leave _expecting_map_save alone;
+                # the timeout below clears it if no map save materialises.
                 self._in_map_save = False
                 self._was_returning = False
 
-            # Safety: if DP1 stays False longer than the timeout the session really
-            # ended (e.g. sunset cancel with no map save).  Clear the expectation so
-            # the next session starts clean.
+            # DP1 stayed False past the timeout: session truly ended (e.g. sunset
+            # cancel with no map save).  Clear so the next scheduled mow starts fresh.
             if self._false_poll_count > MAP_SAVE_TIMEOUT_POLLS:
                 self._expecting_map_save = False
 
         self._prev_dp1 = dp1
+        self._prev_dp118 = dp118
+        self._prev_dp126 = dp126
         super()._handle_coordinator_update()
 
     # ── activity ──────────────────────────────────────────────────────────────
@@ -148,23 +174,18 @@ class EufyRobomowEntity(CoordinatorEntity[EufyMowerCoordinator], LawnMowerEntity
         dp2   = dps.get(DP_PAUSED,      False)
         dp118 = dps.get(DP_PROGRESS,    0)
 
-        # Paused: task active but movement stopped
-        if dp1 and dp2:
+        if not dp1:
+            return LawnMowerActivity.DOCKED
+        if dp2:
             return LawnMowerActivity.PAUSED
-
-        if dp1 and not dp2:
-            # DP118 5–99 while not in post-dock map-save phase → physically returning.
-            # _in_map_save suppresses RETURNING when DP118 climbs after a dock event.
-            if RETURNING_THRESHOLD <= dp118 < 100 and not self._in_map_save:
-                try:
-                    return LawnMowerActivity.RETURNING
-                except AttributeError:
-                    return LawnMowerActivity.MOWING
-            if self._in_map_save:
-                return LawnMowerActivity.DOCKED
+        if self._in_map_save:
+            return LawnMowerActivity.DOCKED
+        if RETURNING_THRESHOLD <= dp118 < 100:
+            return LawnMowerActivity.RETURNING
+        # Suppress MOWING during post-session DP1 flickers: DP126 never increments
+        # during flickers but does so every 30–60 s during real mowing.
+        if self._dp126_confirmed or self._dp1_true_polls < 2:
             return LawnMowerActivity.MOWING
-
-        # DP1 absent or False → no active session → docked / idle
         return LawnMowerActivity.DOCKED
 
     # ── commands ──────────────────────────────────────────────────────────────
