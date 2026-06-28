@@ -31,7 +31,8 @@ from .const import (
     DP_PROGRESS,
     DP_TOTAL_TIME,
     DP_SIGNAL,
-    DP_LIVE_VIEW,
+    DP_LAST_NOTIFICATION,
+    DP_ERROR_CODE,
     DP_TASK_ACTIVE,
     GENERIC_SENSOR_PREFIX,
 )
@@ -52,7 +53,8 @@ EXCLUDED_DPS = {
     "101",  # Rain detection   → dedicated Switch entity
     "109",  # Signal strength  → dedicated Sensor entity
     "110",  # Cut height       → dedicated Number entity
-    "114",  # Live view state  → dedicated Sensor entity
+    "114",  # Last notification → dedicated Sensor entity
+    "115",  # Error code        → dedicated Sensor entity
     "113",  # Session telemetry → dedicated EufyMowingProgressSensor + EufySessionDistanceSensor
     "118",  # Return Progress  → dedicated sensor
     "124",  # Coverage         → dedicated EufyCoverageSensor (blob decode)
@@ -140,10 +142,16 @@ SENSORS: tuple[EufySensorDescription, ...] = (
         icon="mdi:signal",
     ),
     EufySensorDescription(
-        key="live_view",
-        dp=DP_LIVE_VIEW,
-        name="Live View State",
-        icon="mdi:camera",
+        key="last_notification",
+        dp=DP_LAST_NOTIFICATION,
+        name="Last Notification",
+        icon="mdi:bell",
+    ),
+    EufySensorDescription(
+        key="error_code",
+        dp=DP_ERROR_CODE,
+        name="Error Code",
+        icon="mdi:alert-circle",
     ),
 )
 

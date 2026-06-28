@@ -65,19 +65,32 @@ PAD_DIRECTION_MAX = 359  # degrees (full rotation)
 PAD_DIRECTION_STEP = 1  # degrees
 
 # ── DPS READ (status) ──────────────────────────────────────────────────────────
-# Confirmed via live monitoring of Eufy E15 (Tuya v3.5)
+# Confirmed via live monitoring of Eufy E18 / Terramow S1200 (Tuya v3.5)
 
-DP_TASK_ACTIVE = "1"  # bool  True = a mowing/returning session is running
+DP_TASK_ACTIVE = "1"  # bool  True = mowing, returning, or manual/remote control active
 DP_PAUSED = "2"  # bool  True = session paused, False = actively moving
 DP_BATTERY = "8"  # int   Battery level 0–100 %
 DP_VOLUME = "26"  # int   Speaker volume 0–100 %
 DP_CHILD_PROTECTION = "47"  # bool  True = child/pet protection active
 DP_SIGNAL = "109"  # int   Signal strength (raw value; e.g. 50 → −50 dBm)
 DP_CUT_HEIGHT = "110"  # int   Blade height in mm (e.g. 40)
-DP_LIVE_VIEW = "114"  # int   Live-view/camera state:
-#       32  = idle (no live view)
-#       103 = camera enabled (user opened live view)
-#       104 = camera disabled (user closed live view)
+DP_LAST_NOTIFICATION = "114"  # int  Most recent N-code notification from mower.
+#       DP114 is updated whenever the mower emits an N-code event (verbal, toast,
+#       push, or silent). Confirmed on E18 / Terramow S1200:
+#       31  = N31  child lock on                    (toast + verbal)
+#       32  = N32  child lock off                   (toast + verbal)
+#       41  = N41  mowing resumed after charge      (silent)
+#       43  = N43  scheduled mowing started         (push notification)
+#       65  = N65  cannot reach target area         (push notification)
+#       76  = N76  returning to dock to charge      (silent)
+#       103 = N103 live camera on                   (toast)
+#       104 = N104 live camera off                  (toast)
+#       106 = N106 camera preparing                 (silent)
+#       114 = N114 sunset, session cancelled        (toast + verbal)
+#       127 = N127 loading system / boot            (verbal)
+DP_ERROR_CODE = "115"  # int  Error/obstacle code, present during navigation errors
+#       Appears alongside N65 (cannot reach target). Observed value:
+#       904 = cannot reach target area
 DP_PROGRESS = "118"  # int   0–100 % progress of current action
 #       0   = idle / mowing
 #       1-99 = saving map or returning to base
@@ -115,11 +128,23 @@ CUT_HEIGHT_STEP = 5  # mm
 #
 #  DP1 absent,  DP2 absent                    → DOCKED  (cold / never started)
 #  DP1=True,    DP2=False,  DP118=0           → MOWING
-#  DP1=True,    DP2=False,  DP118 5–99        → RETURNING (progress back to base)
-#  DP1=True,    DP2=False,  DP118=100         → MOWING  (briefly docked mid-session
-#                                               for charging; DP1 still True so we
-#                                               report MOWING not DOCKED)
+#  DP1=True,    DP2=False,  DP118 5–99        → RETURNING (physical return to base)
+#                                               ...OR map saving (see below)
 #  DP1 absent/False                           → DOCKED  (no active session)
 #  DP1=True,    DP2=True                      → PAUSED
 #
-RETURNING_THRESHOLD = 5  # DP118 ≥ this value while DP1 active = RETURNING
+# Map-save disambiguation:
+#  When the mower physically docks at end-of-session, DP118 resets to 0 and DP1
+#  briefly goes False then True again for map saving — during which DP118 climbs
+#  again in the same 5–99 range.  Mid-session charge docks look similar but DP1
+#  stays True throughout (no False transition).  The entity tracks this state
+#  machine to suppress RETURNING during map saving (see _handle_coordinator_update).
+#
+RETURNING_THRESHOLD = 5  # DP118 ≥ this value while DP1 active = potentially RETURNING
+
+# After the mower physically docks at end-of-session, DP1 briefly goes False then
+# True again for map saving.  We suppress RETURNING during that map-save phase.
+# If DP1 stays False longer than this many polls the session truly ended (e.g.
+# sunset cancel); abandon the map-save expectation so the next real session is fresh.
+# At POLL_INTERVAL=10 s this is 2 minutes.
+MAP_SAVE_TIMEOUT_POLLS = 12
