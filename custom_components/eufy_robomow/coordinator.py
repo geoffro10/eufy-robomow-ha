@@ -37,7 +37,7 @@ class EufyMowerCoordinator(DataUpdateCoordinator[dict]):
 
     If an EufyCloudClient is provided, cloud DPS are also fetched every
     CLOUD_POLL_INTERVAL seconds (default 5 min).  ALL raw cloud DPS are merged
-    into coordinator.data so every DP is visible as a HA sensor — even cloud-only
+    into coordinator.data so every DP is visible as a HA sensor - even cloud-only
     ones like DP3, DP4, DP36, DP102-DP185 that the local Tuya protocol never
     returns.  For any DP present in both transports the local (real-time) value
     takes precedence.
@@ -65,12 +65,18 @@ class EufyMowerCoordinator(DataUpdateCoordinator[dict]):
         self._device = self._make_device()
         # Use float('-inf') so the first poll always fetches cloud DPS
         self._cloud_last_fetch: float = float("-inf")
-        # Consecutive cloud failures — used for exponential backoff
+        # Consecutive cloud failures - used for exponential backoff
         self._cloud_consecutive_failures: int = 0
         # Track consecutive local-poll failures to know when to recreate the device
         self._consecutive_errors: int = 0
         # Set of all DP keys seen so far (local + cloud), used to detect new DPs
         self._known_dps: set[str] = set()
+        # Most recent raw snapshots, kept separately so entities can distinguish
+        # local truth from stale cloud echoes.
+        self._last_local_dps: dict = {}
+        self._last_cloud_dps: dict = {}
+        self._last_local_update: float = float("-inf")
+        self._last_cloud_update: float = float("-inf")
         # Callbacks invoked when previously-unseen DPS keys appear in a poll.
         # Registered by sensor.py so it can add generic sensors on-the-fly.
         # Callbacks receive the current dps dict as their sole argument.
@@ -99,25 +105,25 @@ class EufyMowerCoordinator(DataUpdateCoordinator[dict]):
         d.set_socketPersistent(False)
         return d
 
-    # ── polling ───────────────────────────────────────────────────────────────
+    #  polling 
 
     async def _async_update_data(self) -> dict:
         """Fetch DPS from device (local) and optionally from cloud.
 
         Strategy:
-          1. Local poll  — always, every POLL_INTERVAL seconds (~10 s).
-          2. Cloud poll  — every CLOUD_POLL_INTERVAL seconds (~5 min).
-             • Fetches ALL raw cloud DPS via tuya.m.device.dp.get.
-             • Merges them into the dict: local values win for any DP in both.
-             • Decoded DP155 settings are stored under cloud_* keys.
-          3. Carry-forward — when cloud poll is not due (or fails), all keys from
+          1. Local poll  - always, every POLL_INTERVAL seconds (~10 s).
+          2. Cloud poll  - every CLOUD_POLL_INTERVAL seconds (~5 min).
+              Fetches ALL raw cloud DPS via tuya.m.device.dp.get.
+              Merges them into the dict: local values win for any DP in both.
+              Decoded DP155 settings are stored under cloud_* keys.
+          3. Carry-forward - when cloud poll is not due (or fails), all keys from
              the previous coordinator.data that are not in the fresh local dps are
              carried forward so cloud-only entities never go unavailable.
-          4. New-DP detection — after the full merge, new DPS keys fire the
+          4. New-DP detection - after the full merge, new DPS keys fire the
              _new_dp_callbacks with the complete dps dict so sensor.py can
              register generic sensors immediately.
         """
-        # ── 1. Local DPS (every POLL_INTERVAL seconds) ────────────────────────
+        #  1. Local DPS (every POLL_INTERVAL seconds) 
         try:
             result = await self.hass.async_add_executor_job(self._device.status)
         except Exception as exc:  # noqa: BLE001
@@ -148,13 +154,17 @@ class EufyMowerCoordinator(DataUpdateCoordinator[dict]):
         dps: dict = result.get("dps", {})
         local_dp_keys: set[str] = set(dps.keys())
 
+        self._last_local_dps = dict(dps)
+        now = time.monotonic()
+        self._last_local_update = now
+
         _LOGGER.debug("Local DPS update: %s", dps)
 
-        # ── 2. Cloud DPS + settings (every CLOUD_POLL_INTERVAL seconds) ───────
+        #  2. Cloud DPS + settings (every CLOUD_POLL_INTERVAL seconds) 
         # Two guards before attempting a cloud poll:
-        #   a) Sun above horizon — mower cannot operate at night, no point refreshing.
+        #   a) Sun above horizon - mower cannot operate at night, no point refreshing.
         #      Uses HA's sun.sun entity; if unavailable defaults to allowing the poll.
-        #   b) Exponential backoff on consecutive failures (5 min → 10 → 20 → 40 → 60).
+        #   b) Exponential backoff on consecutive failures (5 min  10  20  40  60).
         #      _cloud_last_fetch is updated on BOTH success AND failure so a failed
         #      login is not retried every 10 s (which would hammer the Eufy API and
         #      interfere with other integrations sharing the same account).
@@ -164,7 +174,7 @@ class EufyMowerCoordinator(DataUpdateCoordinator[dict]):
             _sun_below_horizon = _sun is not None and _sun.state == "below_horizon"
 
             if _sun_below_horizon:
-                _LOGGER.debug("Sun below horizon — skipping cloud poll")
+                _LOGGER.debug("Sun below horizon - skipping cloud poll")
                 self._carry_forward_cloud_data(dps, local_dp_keys)
             else:
                 backoff = min(
@@ -193,6 +203,8 @@ class EufyMowerCoordinator(DataUpdateCoordinator[dict]):
 
                         self._cloud_last_fetch = now
                         self._cloud_consecutive_failures = 0
+                        self._last_cloud_dps = dict(raw_cloud_dps)
+                        self._last_cloud_update = now
                         _LOGGER.debug(
                             "Cloud poll: %d raw DPS merged, settings=%s",
                             len(raw_cloud_dps),
@@ -215,10 +227,10 @@ class EufyMowerCoordinator(DataUpdateCoordinator[dict]):
                         self._cloud_last_fetch = now
                         self._carry_forward_cloud_data(dps, local_dp_keys)
                 else:
-                    # Not yet due — carry forward previous cloud data
+                    # Not yet due - carry forward previous cloud data
                     self._carry_forward_cloud_data(dps, local_dp_keys)
 
-        # ── 3. New-DP detection (after full merge) ────────────────────────────
+        #  3. New-DP detection (after full merge) 
         current_all_keys = set(dps.keys())
         new_keys = current_all_keys - self._known_dps
 
@@ -255,7 +267,7 @@ class EufyMowerCoordinator(DataUpdateCoordinator[dict]):
             if key not in local_dp_keys:
                 dps[key] = val
 
-    # ── commands ──────────────────────────────────────────────────────────────
+    #  commands 
 
     async def async_send_command(self, dp: str, value) -> bool:
         """Write a single DPS value to the device. Returns True on success."""

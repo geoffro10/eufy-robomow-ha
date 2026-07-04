@@ -4,15 +4,37 @@ Authenticates via Eufy/Tuya mobile API (same flow as eufy-clean-local-key-grabbe
 and reads/writes DP155, a base64-encoded protobuf blob that stores the five
 cloud-managed settings for the E15:
 
-    field 1  (message) : const sub-msg {field1: 40}   ← sub-message, NOT bare varint
+    field 1  (message) : CUT HEIGHT — {1: mm}, mirrors DP110.  Previously assumed
+                         to be a constant {field1: 40}; live data (2026-07-02)
+                         proved writing 40 here physically resets cut height.
     field 2  (message) : travel speed  — empty = slow, {1:1} = normal, {1:2} = fast
-    field 3  (message) : edge distance — {1: mm}  (signed; negative = beyond wire)
-    field 4  (message) : pad direction — {f2:{f1: angle}, f3: fixed, f5: fixed}
+    field 3  (message) : edge distance — {1: mm}  (signed; negative = beyond wire;
+                         negatives encoded as two's-complement 64-bit varint,
+                         10 bytes).  ZERO is encoded as an EMPTY sub-message
+                         (len 0), not {1: 0} — confirmed from live app writes.
+    field 4  (message) : pad direction — {f2:{f1: angle}, f3: ?, f5: ?}
                          angle in degrees (1 unit = 1°); 0 = west (9 o'clock);
                          90 = north (12 o'clock); 180 = east (3 o'clock), etc.
-    field 5  (message) : path distance — {1: mm}
+                         f3/f5 are NOT fixed constants (f5 observed at -306 on a
+                         live device); they must be preserved verbatim on write.
+    field 5  (message) : path distance — {1: mm}; zero likely follows the same
+                         empty-sub-message convention as field 3.
     field 6  (message) : blade speed   — empty = slow, {1:1} = normal, {1:2} = fast
-    field 7  (varint)  : mirrors path_mm (same value as field 5's inner varint)
+    field 7  (varint)  : loosely tracks path_mm; device does not always update it
+
+    UNITS: distance fields always store millimetres.  The Eufy app converts
+    from its display unit before writing (observed: app "-10" in cm mode wrote
+    -100 mm; app "-2 in" wrote -50 mm).
+
+    NOTE: DP155 appears to hold the DEFAULT settings profile (writes were only
+    observed while editing the app's *default* settings screen).  Per-zone
+    customised values likely live elsewhere (DP122/DP150 territory) and are
+    not yet mapped.
+
+    WRITE STRATEGY: never rebuild this blob from a model.  Read the current
+    blob, patch ONLY the field being changed, and re-serialize every other
+    byte verbatim (see _patch_dp155).  Rebuilding from a model clobbered cut
+    height and erased edge distance on a live device (2026-07-02).
 
 NOTE: DP154 was previously assumed to hold pad direction but testing showed it does
 NOT change when the app's direction dial is moved.  DP155 field 4 is the correct
@@ -110,19 +132,15 @@ SPEED_OPTIONS = [SPEED_SLOW, SPEED_NORMAL, SPEED_FAST]
 _SPEED_TO_INT: dict[str, int] = {SPEED_SLOW: 0, SPEED_NORMAL: 1, SPEED_FAST: 2}
 _INT_TO_SPEED: dict[int, str] = {0: SPEED_SLOW, 1: SPEED_NORMAL, 2: SPEED_FAST}
 
-# ── DP155 preserved constants ──────────────────────────────────────────────────
-
-_FIELD1_CONST = 40  # field 1: inner value of sub-message {field1: 40} (constant)
-
-# Field 7 mirrors path_mm (NOT edge_mm as previously assumed).
-# Confirmed by live data: field7=90 when path_mm=90, edge_mm=70.
-
-# Field 4 contains pad direction in sub-field 2 ({f1: angle_degrees}).
-# Sub-fields 3 and 5 within field 4 are device-fixed constants; we preserve
-# them verbatim.  Observed bytes (little-endian protobuf):
-#   f3 = 1a 04 0a 02 5a 5a   (field3, len=4, inner=[f1, len=2, 0x5a, 0x5a])
-#   f5 = 28 5a               (field5, varint=90)
-_FIELD4_SUFFIX = bytes.fromhex("1a040a025a5a285a")  # f3 + f5 (fixed)
+# ── DP155 write safety ─────────────────────────────────────────────────────────
+#
+# The previous implementation rebuilt the entire DP155 blob from a 5-setting
+# model with hardcoded values for the fields it did not manage (field 1 forced
+# to 40, field 4 sub-fields forced to fixed bytes).  Live testing on
+# 2026-07-02 proved this destructive: field 1 is actually cut height (writes
+# physically reset it to 40 mm), field 4.5 held -306 on the test device, and
+# edge distance (field 3) ended up erased.  All writes now go through
+# _patch_dp155(), which preserves every byte it does not explicitly change.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -186,39 +204,113 @@ def _encode_speed_submsg(speed: str) -> bytes:
     return _encode_field(1, 0, int_val)  # {field 1: 1 or 2}
 
 
-def _encode_field4(pad_direction: int) -> bytes:
-    """Encode DP155 field 4 body with the given pad direction angle.
+def _parse_top_level(data: bytes) -> list[tuple[int, int, bytes]]:
+    """Parse one protobuf message level into ordered (field, wire, raw) tuples.
 
-    Structure: {f2: {f1: angle}, f3: fixed, f5: fixed}
-    The f3 and f5 sub-fields are device constants preserved verbatim.
+    ``raw`` holds the field VALUE bytes only (the varint bytes for wire type 0,
+    the inner payload for wire type 2, the fixed 8/4 bytes for types 1/5).
+    Tags and length prefixes are regenerated by :func:`_serialize_fields`, so a
+    parse → serialize round trip with no modifications is byte-identical.
     """
-    f2_inner = _encode_field(1, 0, pad_direction)  # {f1: angle}
-    f2 = _encode_field(2, 2, f2_inner)  # field 2 = {f1: angle}
-    return f2 + _FIELD4_SUFFIX
+    fields: list[tuple[int, int, bytes]] = []
+    pos = 0
+    while pos < len(data):
+        tag, pos = _varint_decode(data, pos)
+        field_num = tag >> 3
+        wire_type = tag & 0x07
+        if wire_type == 0:  # varint — keep the raw varint bytes untouched
+            start = pos
+            _, pos = _varint_decode(data, pos)
+            fields.append((field_num, 0, data[start:pos]))
+        elif wire_type == 2:  # length-delimited
+            length, pos = _varint_decode(data, pos)
+            fields.append((field_num, 2, data[pos : pos + length]))
+            pos += length
+        elif wire_type == 1:  # 64-bit
+            fields.append((field_num, 1, data[pos : pos + 8]))
+            pos += 8
+        elif wire_type == 5:  # 32-bit
+            fields.append((field_num, 5, data[pos : pos + 4]))
+            pos += 4
+        else:
+            raise ValueError(
+                f"Unsupported wire type {wire_type} for field {field_num}"
+            )
+    return fields
 
 
-def _encode_dp155(
-    edge_mm: int,
-    path_mm: int,
-    travel_speed: str,
-    blade_speed: str,
-    pad_direction: int = 90,
+def _serialize_fields(fields: list[tuple[int, int, bytes]]) -> bytes:
+    """Serialize (field, wire, raw) tuples back into protobuf bytes."""
+    out = b""
+    for field_num, wire_type, raw in fields:
+        out += _varint_encode((field_num << 3) | wire_type)
+        if wire_type == 2:
+            out += _varint_encode(len(raw)) + raw
+        else:  # 0, 1, 5 — raw already holds the exact value bytes
+            out += raw
+    return out
+
+
+def _patch_dp155(
+    blob: str,
+    edge_mm: int | None = None,
+    path_mm: int | None = None,
+    travel_speed: str | None = None,
+    blade_speed: str | None = None,
+    pad_direction: int | None = None,
 ) -> str:
-    """Encode the five cloud settings into a DP155 base64 blob."""
-    payload = (
-        _encode_field(
-            1, 2, _encode_field(1, 0, _FIELD1_CONST)
-        )  # field 1: sub-msg {f1:40}
-        + _encode_field(
-            2, 2, _encode_speed_submsg(travel_speed)
-        )  # field 2: travel speed
-        + _encode_field(3, 2, _encode_field(1, 0, edge_mm))  # field 3: edge dist (mm)
-        + _encode_field(4, 2, _encode_field4(pad_direction))  # field 4: pad direction
-        + _encode_field(5, 2, _encode_field(1, 0, path_mm))  # field 5: path dist (mm)
-        + _encode_field(6, 2, _encode_speed_submsg(blade_speed))  # field 6: blade speed
-        + _encode_field(7, 0, path_mm)  # field 7: mirrors path_mm
-    )
-    return base64.b64encode(payload).decode("ascii")
+    """Surgically patch a DP155 blob, changing ONLY the requested fields.
+
+    Every field not being changed — including cut height (field 1), the
+    unknown field 4 sub-fields, field 7, and anything not yet understood —
+    is preserved byte-for-byte from the current device blob.
+    """
+    fields = _parse_top_level(base64.b64decode(blob))
+
+    def _replace(field_num: int, new_raw: bytes) -> None:
+        for i, (fn, _wt, _raw) in enumerate(fields):
+            if fn == field_num:
+                fields[i] = (field_num, 2, new_raw)
+                return
+        fields.append((field_num, 2, new_raw))  # field absent → append
+
+    if edge_mm is not None:
+        # Zero is encoded as an EMPTY sub-message, matching the app's own
+        # convention (observed live: app writes field 3 as len-0 for zero).
+        _replace(3, b"" if edge_mm == 0 else _encode_field(1, 0, edge_mm))
+
+    if path_mm is not None:
+        _replace(5, b"" if path_mm == 0 else _encode_field(1, 0, path_mm))
+        # Field 7 loosely tracks path_mm; keep it in sync when present.
+        for i, (fn, wt, _raw) in enumerate(fields):
+            if fn == 7 and wt == 0:
+                fields[i] = (7, 0, _varint_encode(path_mm))
+                break
+
+    if travel_speed is not None:
+        _replace(2, _encode_speed_submsg(travel_speed))
+
+    if blade_speed is not None:
+        _replace(6, _encode_speed_submsg(blade_speed))
+
+    if pad_direction is not None:
+        # Patch ONLY sub-field 2 inside field 4; preserve f3/f5 verbatim
+        # (f5 is NOT a constant — observed at -306 on a live device).
+        for i, (fn, wt, raw) in enumerate(fields):
+            if fn == 4 and wt == 2:
+                sub_fields = _parse_top_level(raw)
+                replaced = False
+                for j, (sfn, swt, _sraw) in enumerate(sub_fields):
+                    if sfn == 2 and swt == 2:
+                        sub_fields[j] = (2, 2, _encode_field(1, 0, pad_direction))
+                        replaced = True
+                        break
+                if not replaced:
+                    sub_fields.insert(0, (2, 2, _encode_field(1, 0, pad_direction)))
+                fields[i] = (4, 2, _serialize_fields(sub_fields))
+                break
+
+    return base64.b64encode(_serialize_fields(fields)).decode("ascii")
 
 
 def _decode_dp155(blob: str) -> dict[str, Any]:
@@ -428,21 +520,6 @@ def _unpadded_rsa(exponent: int, n: int, plaintext: bytes) -> bytes:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-class TuyaSessionError(RuntimeError):
-    """The Tuya session is invalid/expired — re-authentication should fix it."""
-
-
-# Error codes that indicate an expired or invalid session rather than a
-# device-side problem.  These trigger invalidate + re-login + retry.
-_SESSION_ERROR_CODES = {
-    "USER_SESSION_INVALID",
-    "USER_SESSION_LOSS",
-    "TOKEN_INVALID",
-    "TOKEN_EXPIRED",
-    "SING_VALIDATE_FAILED",
-}
-
-
 class EufyCloudClient:
     """Synchronous client for reading/writing Eufy cloud settings via Tuya mobile API.
 
@@ -501,26 +578,8 @@ class EufyCloudClient:
             },
             timeout=15,
         )
-        # Parse the body BEFORE raising on HTTP status: Eufy returns a JSON
-        # error payload even on 401/403, and we want to surface its message as
-        # a credential error (ValueError) rather than a generic HTTPError.
-        try:
-            data = resp.json()
-        except ValueError:
-            data = None
-
-        if not isinstance(data, dict) or "access_token" not in data:
-            msg = ""
-            if isinstance(data, dict):
-                msg = data.get("msg") or data.get("message") or data.get("error") or str(data)
-            if 400 <= resp.status_code < 500:
-                # Client error → credentials rejected by the server
-                raise ValueError(
-                    f"Eufy login rejected (HTTP {resp.status_code}): {msg}"
-                )
-            # 5xx or malformed body → transient server problem
-            resp.raise_for_status()
-            raise ValueError(f"Eufy login failed: {msg}")
+        resp.raise_for_status()
+        data = resp.json()
 
         self._eufy_token = data["access_token"]
         self._eufy_uid = data["user_info"]["id"]
@@ -582,12 +641,9 @@ class EufyCloudClient:
         payload = resp.json()
 
         if "result" not in payload:
-            error_code = str(payload.get("errorCode", "unknown"))
-            # Session/auth errors get their own type so the retry wrapper can
-            # re-authenticate; everything else is a device-side error that a
-            # fresh session would not fix.
-            if error_code in _SESSION_ERROR_CODES or "SESSION" in error_code.upper():
-                raise TuyaSessionError(f"Session error [{error_code}]: {payload}")
+            # Surface device-side errors with a recognisable prefix so callers
+            # can distinguish them from transient session / auth failures.
+            error_code = payload.get("errorCode", "unknown")
             raise RuntimeError(f"Device error [{error_code}]: {payload}")
 
         return payload["result"]
@@ -635,16 +691,19 @@ class EufyCloudClient:
         self._eufy_token = None
 
     def _tuya_request_with_retry(self, *args, **kwargs) -> Any:
-        """Call _tuya_request; on session expiry invalidate, re-login and retry once.
+        """Call _tuya_request; on session/auth failure invalidate and retry once.
 
         Device-side errors (DEVICE_OFFLINE, etc.) are not retried because
         invalidating the session won't fix them.
         """
         try:
             return self._tuya_request(*args, **kwargs)
-        except TuyaSessionError as exc:
+        except RuntimeError as exc:
+            # "Device error [...]" prefix → device-side issue, no point retrying
+            if str(exc).startswith("Device error"):
+                raise
             _LOGGER.warning(
-                "Tuya session expired (%s) — re-authenticating and retrying once", exc
+                "Tuya API call failed, invalidating sessions and retrying once"
             )
             self._invalidate_sessions()
             return self._tuya_request(*args, **kwargs)
@@ -758,40 +817,43 @@ class EufyCloudClient:
         blade_speed: str | None = None,
         pad_direction: int | None = None,
     ) -> None:
-        """Write updated cloud settings to DP155.
+        """Write updated cloud settings to DP155 via surgical read-modify-write.
 
-        All five settings are always written together.  Unchanged fields are
-        read from the device first to preserve them.
+        Only the fields passed as non-None are changed.  The current blob is
+        fetched from the cloud and every other byte — cut height (field 1),
+        the unknown field 4 sub-fields, field 7, and any fields not yet
+        understood — is preserved verbatim.  This replaces the previous
+        rebuild-from-model approach, which clobbered cut height to 40 mm and
+        erased edge distance on a live device (2026-07-02).
         """
-        # Read current values so we can fill in any unchanged fields.
-        current = self.get_settings()
+        raw_dps, _settings = self.get_all_dps()
+        current_blob = raw_dps.get("155")
+        if not current_blob:
+            raise RuntimeError("DP155 not present in cloud response; cannot write")
 
-        new_edge_mm = edge_mm if edge_mm is not None else current["edge_mm"]
-        new_path_mm = path_mm if path_mm is not None else current["path_mm"]
-        new_travel_speed = (
-            travel_speed if travel_speed is not None else current["travel_speed"]
-        )
-        new_blade_speed = (
-            blade_speed if blade_speed is not None else current["blade_speed"]
-        )
-        new_pad_direction = (
-            pad_direction if pad_direction is not None else current["pad_direction"]
+        new_blob = _patch_dp155(
+            current_blob,
+            edge_mm=edge_mm,
+            path_mm=path_mm,
+            travel_speed=travel_speed,
+            blade_speed=blade_speed,
+            pad_direction=pad_direction,
         )
 
-        blob155 = _encode_dp155(
-            new_edge_mm,
-            new_path_mm,
-            new_travel_speed,
-            new_blade_speed,
-            new_pad_direction,
-        )
+        if new_blob == current_blob:
+            _LOGGER.debug("DP155 unchanged after patch; skipping publish")
+            return
+
         _LOGGER.debug(
-            "Publishing DP155: edge=%dmm path=%dmm travel=%s blade=%s pad=%d°",
-            new_edge_mm,
-            new_path_mm,
-            new_travel_speed,
-            new_blade_speed,
-            new_pad_direction,
+            "Publishing DP155 patch (edge=%s path=%s travel=%s blade=%s pad=%s): "
+            "%s -> %s",
+            edge_mm,
+            path_mm,
+            travel_speed,
+            blade_speed,
+            pad_direction,
+            current_blob,
+            new_blob,
         )
         self._tuya_request_with_retry(
             "tuya.m.device.dp.publish",
@@ -799,6 +861,6 @@ class EufyCloudClient:
                 "devId": self._device_id,
                 "gwId": self._device_id,
                 "uid": self._tuya_username,
-                "dps": {"155": blob155},
+                "dps": {"155": new_blob},
             },
         )

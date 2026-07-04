@@ -10,11 +10,21 @@ Cloud entities (backed by DP155 via Tuya mobile API):
   • Pad Direction   — DP155 field 4, 0–359°, step 1° (rotary; full rotation)
 
 Path distance is a fixed 3-option select; see select.py.
+
+UNIT DISPLAY: Cut Height and Edge Distance declare NumberDeviceClass.DISTANCE,
+so users can switch the DISPLAYED unit (e.g. inches) per entity in
+HA → entity settings → Unit of measurement.  HA converts display values both
+ways; async_set_native_value always receives NATIVE units (mm / cm), so the
+mm-based cloud write path is unaffected.  The device itself always stores mm.
 """
 
 from __future__ import annotations
 
-from homeassistant.components.number import NumberEntity, NumberMode
+from homeassistant.components.number import (
+    NumberDeviceClass,
+    NumberEntity,
+    NumberMode,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE, UnitOfLength
 from homeassistant.core import HomeAssistant
@@ -70,6 +80,7 @@ class EufyCutHeightNumber(CoordinatorEntity[EufyMowerCoordinator], NumberEntity)
     _attr_has_entity_name = True
     _attr_name = "Cut Height"
     _attr_icon = "mdi:ruler"
+    _attr_device_class = NumberDeviceClass.DISTANCE
     _attr_native_unit_of_measurement = UnitOfLength.MILLIMETERS
     _attr_native_min_value = CUT_HEIGHT_MIN
     _attr_native_max_value = CUT_HEIGHT_MAX
@@ -141,6 +152,7 @@ class EufyEdgeDistanceNumber(CoordinatorEntity[EufyMowerCoordinator], NumberEnti
     _attr_has_entity_name = True
     _attr_name = "Edge Distance"
     _attr_icon = "mdi:border-outside"
+    _attr_device_class = NumberDeviceClass.DISTANCE
     _attr_native_unit_of_measurement = UnitOfLength.CENTIMETERS
     _attr_native_min_value = EDGE_DISTANCE_MIN  # -15 cm
     _attr_native_max_value = EDGE_DISTANCE_MAX  #  15 cm

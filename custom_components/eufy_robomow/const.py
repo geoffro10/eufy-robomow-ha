@@ -50,8 +50,13 @@ EDGE_DISTANCE_STEP = 1  # cm
 
 # ── Path distance — app has exactly 3 options: 8 / 10 / 12 cm ────────────────
 # Stored as mm in DP155 field 5.  Exposed as a SelectEntity.
-PATH_DISTANCE_OPTIONS: list[str] = ["8 cm", "10 cm", "12 cm"]
-PATH_DISTANCE_MM: dict[str, int] = {"8 cm": 80, "10 cm": 100, "12 cm": 120}
+# Updated to show inches as well since the app can be changed to that too
+PATH_DISTANCE_MM: dict[str, int] = {
+    "8 cm (3.1 in)": 80,
+    "10 cm (3.9 in)": 100,
+    "12 cm (4.7 in)": 120,
+}
+PATH_DISTANCE_OPTIONS: list[str] = list(PATH_DISTANCE_MM.keys())
 
 # ── Pad direction (mowing path angle) — DP155 field 4 ─────────────────────────
 # Stored as an integer in DP155 field 4, sub-field 2, inner field 1.
