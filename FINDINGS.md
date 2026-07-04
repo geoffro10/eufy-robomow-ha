@@ -108,14 +108,16 @@ right after the mower is already home.
 - **Post-session "scheduler flicker":** DP1 briefly goes True (30s–5min) with no N-code change and no DP126 increment, then drops again. Purely a housekeeping/scheduler artifact — must be displayed as DOCKED, not MOWING. Suppressed by requiring at least one DP126 increment (or a very short grace window) before trusting a DP1 rise as genuine mowing.
 - **HA-initiated start:** generates no N-code. The integration tracks its own `CMD_START` timestamp and trusts the next DP1 rising edge within a short window as genuine.
 
-### Known remaining limitation
+### Previously-suspected limitation, now confirmed fixed
 
-`CMD_DOCK` sets DP1=False immediately on command, but the mower takes 1–2
-minutes to physically travel home. There is currently no clean way to show
-RETURNING for a *manually commanded* dock in the same instant the command is
-sent, since the only local signal (DP1) already reads False. Not yet solved;
-low priority since it's cosmetic (docked shows a beat early, self-corrects
-once the mower's own N76/return sequence would normally have fired).
+An earlier version of this document noted that CMD_DOCK might show DOCKED
+instantly rather than RETURNING, since it sets DP1=False immediately while
+the mower still takes 1-2 minutes to physically travel home. Live-tested
+2026-07-04: pressing Dock from the HA lawn_mower entity while actively
+mowing correctly transitions the entity to RETURNING (not DOCKED), because
+the DP1 True→False edge is evaluated the same way regardless of what
+caused it — command or natural session end. The phase-machine rewrite
+resolved this as a side effect; no further work needed here.
 
 ## 5. Zone table (DP122 / DP107 / schedule data)
 

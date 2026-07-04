@@ -360,6 +360,7 @@ class EufySensor(CoordinatorEntity[EufyMowerCoordinator], SensorEntity):
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.data[CONF_DEVICE_ID])},
         )
+        self._max_seen_total_time_raw: int | None = None
 
     @property
     def native_value(self) -> Any:
@@ -368,7 +369,20 @@ class EufySensor(CoordinatorEntity[EufyMowerCoordinator], SensorEntity):
             return None
         # Convert DP125 raw units → hours
         if self.entity_description.dp == DP_TOTAL_TIME:
-            return round((raw * DP125_SECONDS_PER_UNIT) / 3600, 1)
+            if (
+                self._max_seen_total_time_raw is None
+                or raw >= self._max_seen_total_time_raw
+            ):
+                self._max_seen_total_time_raw = raw
+            else:
+                _LOGGER.debug(
+                    "DP125 decreased (%s -> %s), likely a mower reboot; "
+                    "holding at previous high-water mark",
+                    self._max_seen_total_time_raw, raw,
+                )
+            return round(
+                (self._max_seen_total_time_raw * DP125_SECONDS_PER_UNIT) / 3600, 1
+            )
         # Convert DP109 raw signal → negative dBm (device sends 58, means -58 dBm)
         if self.entity_description.dp == DP_SIGNAL:
             return -raw
