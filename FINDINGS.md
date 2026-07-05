@@ -24,17 +24,23 @@ probably stale — update the code to match this file.
 | 101 | bool | Stop-on-rain-detection setting. |
 | 109 | int | Signal strength, raw. Real value = `-raw` dBm (e.g. `54` → -54 dBm). |
 | 110 | int | Cut height, mm. Mirrors DP155 field 1 (cloud). |
+| 113 | blob | **Live session telemetry.** field1 = mode (4 while mowing/returning), field2 = **zone identifier for the active session** (see §5a — fully calibrated table), field3 = area covered so far, field5 = distance traveled. The very first reading right after a session starts can be a transient value that settles within one poll cycle — always use the second or later reading. |
 | 114 | int | **Last N-code notification.** Not a state — see §2. |
 | 115 | int | **Last E-code (error) notification.** Sticky — holds the last error until a new one occurs, does not clear itself. See §3. |
 | 118 | int | **Map-saving progress, 0→100.** Climbs ONLY after the mower has already physically docked (after a DP1 False→True transition). Does **not** track the physical return journey — see §4. Also climbs in-place (from 100, not 0) on "stop without saving progress." |
-| 125 | int | Total mow time, ~6.6 sec/unit. Updates in ~60-unit batches roughly hourly. Can jump backward after a mower reboot (known `total_increasing` sensor warning in HA — cosmetic, not a bug in the integration). |
+| 119 | blob | **No-go zone MODIFICATION marker** (existing zones only) — see §5b. |
+| 120 | blob | **General zone/map configuration marker** — see §5b. |
+| 121 | blob | **Manual/remote-control session marker** — see §5b. |
+| 125 | int | Total mow time, ~6.6 sec/unit. Updates in ~60-unit batches roughly hourly. Can jump backward after a mower reboot (known `total_increasing` sensor warning in HA — cosmetic, not a bug in the integration; defensive clamp implemented in `sensor.py`). |
 | 126 | int | **Mowed area counter.** Increments every 30–90s during genuine mowing; never increments during scheduler flickers or map saving. This is the single strongest confirmation signal for "is the mower actually cutting grass right now." |
 | 131 | int | Always `90` in every observation. Static config, meaning unconfirmed (possibly a default pad-direction fallback). |
 | 132 | bool | Smart no-go-zone suggestions enabled. |
 | 133 | bool | "Real lawn map" feature enabled. |
 | 134 | str | Network — `"Wifi"` / `"Cellular"` / `None`. Flickers to `None` briefly and unreliably during mowing; not usable as a connectivity signal. |
 | 141 | bool | Allow mowing on yellow/dry grass. |
-| 137, 139, 140, 146, 170, 178, 181 | — | Never observed to change during any mowing, pausing, charging, or manual-control test. Read-only configuration values. **Exception:** DP146 toggled 0↔1 multiple times, always within seconds of an app *settings* edit (cut height, edge distance, blade speed) — provisional label: **settings-edit/sync-in-progress flag.** Polarity not fully pinned down (seen both 0→1 and 1→0 during edits). |
+| 143 | blob | field1 = nonce/counter (not time, not monotonic). field2: `2` at idle and during remote-control sessions; `6` observed during 4 manually-app-started zone mows. **Falsified** as a general "autonomous mowing" flag by a confirmed scheduled (N43) mow that stayed at `2` throughout — see §5b for the revised hypothesis. |
+| 137, 139, 140, 170, 178, 181 | — | Never observed to change during any mowing, pausing, charging, or manual-control test. Read-only configuration values. |
+| 146 | bool | **Settings mode.** `0` = default settings mode, `1` = customized settings mode. Confirmed by direct mode-switch test: flips immediately and cleanly in both directions when toggling between the app's "Default" and "Customized" settings screens. Not related to individual setting edits — a plain per-zone param edit did not touch it. |
 | 171–177, 182–185 | int | Always `-2147483647` (INT32_MIN) — null/unset sentinel. |
 
 ## 2. N-codes (DP114) — notification register
@@ -112,28 +118,46 @@ right after the mower is already home.
 
 An earlier version of this document noted that CMD_DOCK might show DOCKED
 instantly rather than RETURNING, since it sets DP1=False immediately while
-the mower still takes 1-2 minutes to physically travel home. Live-tested
-2026-07-04: pressing Dock from the HA lawn_mower entity while actively
-mowing correctly transitions the entity to RETURNING (not DOCKED), because
-the DP1 True→False edge is evaluated the same way regardless of what
-caused it — command or natural session end. The phase-machine rewrite
-resolved this as a side effect; no further work needed here.
+the mower still takes 1-2 minutes to physically travel home. Live-tested:
+pressing Dock from the HA lawn_mower entity while actively mowing correctly
+transitions the entity to RETURNING (not DOCKED), because the DP1
+True→False edge is evaluated the same way regardless of what caused it —
+command or natural session end. The phase-machine rewrite resolved this as
+a side effect; no further work needed here.
 
-## 5. Zone table (DP122 / DP107 / schedule data)
+### Confirmed: integration reload mid-session recovers cleanly
 
-Confirmed by controlled single-zone schedule creation and reading the
-resulting DP122 zone byte for each, cross-checked against a second
-"every zone except X" record:
+Observed live — a config-entry reload (triggered by unrelated dashboard
+changes) occurred while the mower was actively mowing. The lawn_mower
+entity briefly read DOCKED for ~54 seconds (one DP126 poll cycle) before
+self-correcting to MOWING via the existing DP126 promotion logic (rule 4).
+Only the accurate "mowing started" notification fired; no false "session
+finished" notification occurred despite the entity passing through DOCKED
+during the reload.
 
-| Zone # | Name |
-|---|---|
-| 7 | Front Yard |
-| 8 | Road |
-| 9 | Side House |
-| 10 | Driveway |
-| 11 | Back Yard 2 |
-| 12 | Back Yard 1 |
-| 13 | Back Yard 3 |
+## 5. Zones
+
+### 5a. Zone identifier table (DP113 field2, fully calibrated)
+
+Determined by dedicated single-zone manual mows for every zone, reading
+DP113's field2 value. The first reading immediately after a session starts
+can be a transient value that settles within one poll cycle (seen for 4 of
+7 zones; the other 3 were stable from the first reading) — always use the
+second or later reading as authoritative.
+
+| Zone # | DP113 field2 |
+|--------|--------------|
+| 7      | 1279         |
+| 8      | 531          |
+| 9      | 208          |
+| 10     | 568          |
+| 11     | 1569         |
+| 12     | 874          |
+| 13     | 1230         |
+
+Every value is distinct with comfortable margin between neighbors — reliable
+as an exact-match lookup. This enables a "Current Zone" sensor: match live
+DP113 field2 against this table while DP1=True.
 
 Zone numbers are the mower's own internal IDs (not app-display order) and
 survive zone renaming. DP160 (`"02344139"`) is a separate zone/lawn-map
@@ -152,6 +176,46 @@ value in its `f1` sub-field both times. Current best read of DP107:
 - `f3 = 1` — generic task-active flag
 - Absent / `{f4: N}` — idle, with `N` as an idle sub-stage counter
 
+### 5b. Zone/app-interaction marker DPs (119, 120, 121, 143)
+
+Four DPs that are nonce-like counters signaling "something changed," not
+the changed value itself — same character as DP122's revision field (§6).
+Distinguished by extensive controlled testing across zone-param edits,
+no-go zone create/edit/delete, must-mow zone creation, switch toggles,
+manual-control sessions, and both manual and scheduled zone-mow starts.
+
+- **DP119** — fires on editing an EXISTING no-go zone only. Silent for
+  zone creation, zone deletion, zone-param edits, and switch toggles
+  (tested against child lock specifically).
+- **DP120** — broadest marker. Fires on every zone/map-related edit
+  tested: per-zone param edits (2 zones), no-go zone edit, no-go zone
+  creation (fires twice, one poll apart — likely two internal writes:
+  shape-saved then map-recalculated), no-go zone deletion, must-mow zone
+  creation with obstacle height. 6-for-6 across every category tried.
+- **DP121** — fires specifically during manual/remote-control driving
+  sessions. Silent across 6 clean autonomous zone-mow starts (one per
+  zone) and all zone/no-go config edit tests. Confirmed via an isolated
+  test (remote control only, no zone-mow activity nearby) showing DP121
+  change right at session engagement and again at exit.
+- **DP143 field2** — value `2` at idle AND during remote-control
+  sessions; value `6` observed during 4 manually-app-started zone mows.
+  **Original hypothesis falsified**: a confirmed scheduled (N43)
+  autonomous mow stayed at `2` throughout, verified against 5 separate
+  real cloud polls landing squarely inside the active session (ruling out
+  a polling-gap explanation). Revised leading hypothesis: DP143 field2
+  tracks the app's zone-picker/manual-start UI being used, not the
+  mower's physical mowing state — consistent with every "field2=6"
+  observation being a manual app-initiated start and the one
+  scheduled/autonomous start showing no change. Not yet directly
+  confirmed; needs a test isolating the exact moment of the app's start
+  button tap.
+
+Per-zone parameter VALUES (e.g. configured grass/cut height per zone) are
+still not readable from any known DP — these four markers confirm WHETHER
+something zone-related was edited, not the resulting value. Likely only
+readable via the same encrypted app channel blocking schedule writes (§8),
+or embedded in a blob not yet decoded.
+
 ## 6. DP122 — schedule storage (fully decoded)
 
 DP122 is a protobuf blob holding all mowing schedules. **Confirmed
@@ -161,13 +225,19 @@ schedule record is silently discarded by the device and DP122 is
 regenerated from the mower's own internal schedule store on the next poll.
 **The write channel for schedules is not DP122** — see §8.
 
+Merely **opening** the app's schedule screen (no edits made) has also been
+observed to trigger a DP122 republish — revision counter changes, content
+identical. DP122 isn't written only on actual schedule changes; viewing it
+can trigger a republish too.
+
 ### Structure
 
 ```
 DP122
 ├─ field 2:  revision counter (varint) — NOT monotonic, appears to be a
 │            hash/nonce; changes on every schedule edit, including ones
-│            that don't change content (e.g. an identity write-back)
+│            that don't change content (e.g. an identity write-back or
+│            simply opening the schedule screen)
 ├─ field 4:  schedule container
 │   └─ field 1 (repeated): one entry per schedule record
 │       ├─ field 1: record ID (varint; 0 is omitted when absent — the
@@ -189,8 +259,7 @@ DP122
 │           │               weekly schedules)
 │           ├─ field 2: constant `1` in every observation
 │           └─ field 3: **zone list** — raw packed bytes, one byte per
-│                       zone number, in mow order (e.g. bytes [10,8,9] =
-│                       Driveway then Road then Side House)
+│                       zone number (see §5a table), in mow order
 ├─ field 2 (top-level, after the container): sunrise {f1: hour, f2: minute}
 └─ field 3 (top-level): sunset {f1: hour, f2: minute}
       — this is almost certainly the trigger source for N114 (sunset
@@ -208,10 +277,10 @@ just "a zone list with nothing in it" — a distinct record shape.
 
 ### Special record: "every zone except X"
 
-Confirmed by creating a "mow everything except Back Yard 1 (zone 12)"
-schedule: the zone list contains every zone number **except** the excluded
-one (i.e. the included zones are listed explicitly; exclusion is achieved
-by omission, there is no separate "exclude" flag/field).
+Confirmed by creating a "mow everything except zone 12" schedule: the zone
+list contains every zone number **except** the excluded one (i.e. the
+included zones are listed explicitly; exclusion is achieved by omission,
+there is no separate "exclude" flag/field).
 
 ## 7. DP155 — cloud default settings (write-safe)
 
@@ -224,7 +293,7 @@ field 1 (msg)    : cut height, mm — {1: mm}. Mirrors DP110.
                    {1: 40} and rebuilt it on every write. That was wrong and
                    destructive — it silently reset cut height to 40mm on
                    every cloud write of ANY other setting. Confirmed via
-                   live testing 2026-07-02.
+                   live testing.
 field 2 (msg)    : travel speed — empty submsg = slow, {1:1} = normal,
                    {1:2} = fast
 field 3 (msg)    : edge distance, mm, signed. Negative = mower cuts beyond
@@ -251,9 +320,9 @@ entry "-2 in" while in inch mode wrote -50mm (2in ≈ 50.8mm, rounded).
 
 **DP155 is a DEFAULT-settings profile, not per-zone.** All observed writes
 happened only while editing the app's *default* settings screen. Per-zone
-customized settings (if the app supports them per-zone) likely live
-elsewhere — possibly folded into the DP122/DP150 territory — and are not
-yet mapped.
+customized settings live elsewhere (see §5b — DP119/120 respond to per-zone
+param edits, but the actual configured values still aren't readable from
+any known DP).
 
 **Write strategy (implemented in `cloud.py` `_patch_dp155`):** never rebuild
 this blob from a settings model. Fetch the current blob, parse it into
@@ -304,9 +373,9 @@ by this limitation.
 ## 9. Miscellaneous confirmed odds and ends
 
 - **DP125 backward jumps**: observed after what was likely a mower firmware
-  reboot. Triggers HA's `total_increasing` sensor warning. Cosmetic only —
-  not indicative of an integration bug, but worth a defensive fix (ignore
-  decreases) if the warning noise becomes bothersome.
+  reboot. Triggers HA's `total_increasing` sensor warning. Defensive fix
+  implemented in `sensor.py`: the sensor clamps to the highest raw value
+  seen and logs the anomaly at debug level instead of reporting a decrease.
 - **DP109 (signal strength) transient dropout to `0`**: seen briefly during
   active mowing; self-corrects within one poll. Not a connectivity issue.
 - **DP134 (`"Wifi"`/`None`) flicker**: happens routinely during mowing
@@ -314,9 +383,8 @@ by this limitation.
   connectivity signal — do not build automations on it.
 - **Manual/remote control** (app joystick driving) sets DP1=True with no
   distinguishing N-code and no DP126 movement (the mower isn't cutting
-  grass while just being driven). The integration cannot currently tell
-  "manual driving" apart from "about to start mowing" other than by the
-  eventual DP126 confirmation (or lack of it).
+  grass while just being driven). DP121 (§5b) is the confirmed marker for
+  these sessions, distinguishing them from autonomous mowing.
 - **"Stop without saving progress"** (an app option when cancelling
   mid-mow): triggers an in-place map save — DP118 climbs from a non-zero
   value (not reset to 0 first) while DP1 stays True the whole time, then
@@ -327,7 +395,9 @@ by this limitation.
 
 ---
 
-*Last updated from live findings through 2026-07-04. Confirmed against a
-full end-to-end validated test run (scheduled start → mowing → session
-end → physical return → dock → map save → idle) with zero spurious state
-transitions.*
+*Last updated from live findings after a full afternoon of zone/app-marker
+reverse-engineering. Confirmed against a full end-to-end validated test
+run (scheduled start → mowing → session end → physical return → dock →
+map save → idle) with zero spurious state transitions, plus a complete
+7-zone DP113 calibration pass and controlled tests isolating DP119, DP120,
+DP121, and DP143.*
