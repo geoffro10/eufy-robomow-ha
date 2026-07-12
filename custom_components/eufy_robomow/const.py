@@ -82,20 +82,30 @@ DP_CUT_HEIGHT = "110"  # int   Blade height in mm (e.g. 40)
 DP_LAST_NOTIFICATION = "114"  # int  Most recent N-code notification from mower.
 #       DP114 is updated whenever the mower emits an N-code event (verbal, toast,
 #       push, or silent). Confirmed on E18 / Terramow S1200:
+#       30  = N30  low battery, returning to charge  (unconfirmed channel)
 #       31  = N31  child lock on                    (toast + verbal)
 #       32  = N32  child lock off                   (toast + verbal)
 #       41  = N41  mowing resumed after charge      (silent)
 #       43  = N43  scheduled mowing started         (push notification)
 #       65  = N65  cannot reach target area         (push notification)
+#       66  = N66  mowing session ended              (push, "Task Completed")
 #       76  = N76  returning to dock to charge      (silent)
+#       96  = N96  schedule cancelled by user        (silent; provisional)
 #       103 = N103 live camera on                   (toast)
 #       104 = N104 live camera off                  (toast)
 #       106 = N106 camera preparing                 (silent)
 #       114 = N114 sunset, session cancelled        (toast + verbal)
 #       127 = N127 loading system / boot            (verbal)
-DP_ERROR_CODE = "115"  # int  Error/obstacle code, present during navigation errors
-#       Appears alongside N65 (cannot reach target). Observed value:
-#       904 = cannot reach target area
+#       180 = N180 account session re-established    (login; provisional)
+#       302 = N302 standby >12h, automatic shutdown  (dock left unplugged)
+# See N_CODE_TEXT below for the human-readable lookup used by sensor.py.
+DP_ERROR_CODE = "115"  # int  Error/obstacle code (E-code), sticky until next error.
+#       201 = E0201 robot lifted off the ground
+#       903 = E0903 robot trapped, obstacles need clearing
+#       904 = E0904 cannot reach target area (pairs with N65)
+#       909 = E0909 robot not on the lawn or a previously-created pathway
+#       910 = E0910 not charging properly (observed cause: dock unplugged)
+# See E_CODE_TEXT below for the human-readable lookup used by sensor.py.
 DP_PROGRESS = "118"  # int   0–100 % progress of current action
 #       0   = idle / mowing
 #       1-99 = saving map or returning to base
@@ -108,6 +118,38 @@ DP_SMART_SUGGESTION = "132"  # bool  Smart suggestion for no-go zones
 DP_REAL_LAWN_MAP = "133"  # bool  Real lawn map feature enabled
 DP_NETWORK = "134"  # str   "Wifi" or "Cellular"
 DP_MOW_YELLOW_GRASS = "141"  # bool  Allow mowing on yellow/dry grass
+
+# ── N-code / E-code human-readable lookups ────────────────────────────────────
+# Used by sensor.py's EufyNotificationTextSensor / EufyErrorTextSensor to turn
+# the raw DP114 / DP115 codes into readable text, in-integration (no external
+# HA template helpers required). Unrecognized codes fall back to "Code N" /
+# "Unknown error N" so a brand-new code never shows a blank/broken sensor.
+N_CODE_TEXT: dict[int, str] = {
+    30: "Low battery — returning to charge",
+    31: "Child lock turned on",
+    32: "Child lock turned off",
+    41: "Mowing resumed after charging",
+    43: "Scheduled mowing started",
+    65: "Cannot reach target area",
+    66: "Mowing session ended",
+    76: "Returning to dock",
+    96: "Schedule cancelled",
+    103: "Live camera turned on",
+    104: "Live camera turned off",
+    106: "Camera preparing",
+    114: "Sunset — mowing cancelled for today",
+    127: "System starting up",
+    180: "Account reconnected",
+    302: "Standby time exceeded 12 hours — shut down",
+}
+
+E_CODE_TEXT: dict[int, str] = {
+    201: "Robot is lifted off the ground",
+    903: "Robot is trapped — obstacles need clearing",
+    904: "Cannot reach target area",
+    909: "Robot not on lawn/pathway",
+    910: "Not charging properly",
+}
 
 # ── Unmapped DPs for reverse engineering (all DPS exposed as sensors) ─────────
 # These are automatically discovered and added as generic sensors.

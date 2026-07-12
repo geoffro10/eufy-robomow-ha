@@ -84,6 +84,13 @@ Same design as DP114, but for error/fault conditions specifically. Also sticky.
 | 903 | E0903 — robot trapped, obstacles need clearing |
 | 904 | E0904 — cannot reach target area (pairs with N65) |
 
+### Human-readable code lookups moved in-integration
+`N_CODE_TEXT` / `E_CODE_TEXT` dicts in `const.py`, consumed by
+`EufyNotificationTextSensor` / `EufyErrorTextSensor` in `sensor.py`.
+Replaces the two external HA template helpers used earlier — same
+lookup tables, now version-controlled with the integration and
+included automatically on a fresh install.
+
 ## 4. Activity state machine
 
 ### The central discovery: DP118 is map-save progress, not return progress

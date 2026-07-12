@@ -35,6 +35,8 @@ from .const import (
     DP_ERROR_CODE,
     DP_TASK_ACTIVE,
     GENERIC_SENSOR_PREFIX,
+    N_CODE_TEXT,
+    E_CODE_TEXT,
 )
 from .coordinator import EufyMowerCoordinator
 
@@ -273,6 +275,8 @@ async def async_setup_entry(
     entities.append(EufyMowingProgressSensor(coordinator, entry))
     entities.append(EufySessionDistanceSensor(coordinator, entry))
     entities.append(EufyCoverageSensor(coordinator, entry))
+    entities.append(EufyNotificationTextSensor(coordinator, entry))
+    entities.append(EufyErrorTextSensor(coordinator, entry))
     async_add_entities(entities)
 
     # Track which DP IDs already have a generic sensor so we never duplicate.
@@ -495,6 +499,78 @@ class EufySessionDistanceSensor(CoordinatorEntity[EufyMowerCoordinator], SensorE
         raw_blob = self.coordinator.data.get(_DP_SESSION)
         _, _, dist = _decode_dp113(raw_blob)
         return dist
+
+
+class EufyNotificationTextSensor(CoordinatorEntity[EufyMowerCoordinator], SensorEntity):
+    """Human-readable text for the current DP114 N-code.
+
+    Companion to the numeric "Last Notification" sensor (which stays numeric
+    so existing automations keyed on the raw code, e.g. to: "903", are
+    unaffected). Looks up N_CODE_TEXT from const.py; unrecognized codes fall
+    back to "Code N" rather than showing blank.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Last Notification Text"
+    _attr_icon = "mdi:bell-outline"
+
+    def __init__(
+        self,
+        coordinator: EufyMowerCoordinator,
+        entry: ConfigEntry,
+    ) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.data[CONF_DEVICE_ID]}_last_notification_text"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.data[CONF_DEVICE_ID])},
+        )
+
+    @property
+    def native_value(self) -> str | None:
+        raw = self.coordinator.data.get(DP_LAST_NOTIFICATION)
+        if raw is None:
+            return None
+        try:
+            code = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return N_CODE_TEXT.get(code, f"Code {code}")
+
+
+class EufyErrorTextSensor(CoordinatorEntity[EufyMowerCoordinator], SensorEntity):
+    """Human-readable text for the current DP115 E-code.
+
+    Companion to the numeric "Error Code" sensor (kept numeric so existing
+    automations keyed on the raw code, e.g. to: "201", are unaffected).
+    Looks up E_CODE_TEXT from const.py; unrecognized codes fall back to
+    "Unknown error N" rather than showing blank.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Error Text"
+    _attr_icon = "mdi:alert-circle-outline"
+
+    def __init__(
+        self,
+        coordinator: EufyMowerCoordinator,
+        entry: ConfigEntry,
+    ) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.data[CONF_DEVICE_ID]}_error_text"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.data[CONF_DEVICE_ID])},
+        )
+
+    @property
+    def native_value(self) -> str | None:
+        raw = self.coordinator.data.get(DP_ERROR_CODE)
+        if raw is None:
+            return None
+        try:
+            code = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return E_CODE_TEXT.get(code, f"Unknown error {code}")
 
 
 class EufyGenericSensor(CoordinatorEntity[EufyMowerCoordinator], SensorEntity):
